@@ -5,3 +5,4 @@ vendor/
 # IDE-specific settings
 .idea
 .vscode
+/.project
