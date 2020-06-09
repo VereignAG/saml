@@ -3,7 +3,8 @@ package saml
 import (
 	"bytes"
 	"compress/flate"
-	"crypto/rsa"
+	"crypto"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/xml"
@@ -19,7 +20,7 @@ import (
 	dsig "github.com/russellhaering/goxmldsig"
 	"github.com/russellhaering/goxmldsig/etreeutils"
 
-	"github.com/crewjam/saml/xmlenc"
+	"github.com/vereignag/saml/xmlenc"
 )
 
 // NameIDFormat is the format of the id
@@ -62,7 +63,7 @@ type ServiceProvider struct {
 	EntityID string
 
 	// Key is the RSA private key we use to sign requests.
-	Key *rsa.PrivateKey
+	Key crypto.PrivateKey
 
 	// Certificate is the RSA public part of Key.
 	Certificate   *x509.Certificate
@@ -101,6 +102,27 @@ type ServiceProvider struct {
 	// SignatureVerifier, if non-nil, allows you to implement an alternative way
 	// to verify signatures.
 	SignatureVerifier SignatureVerifier
+
+	// Used to determine if service provider should sign requests. If not set defaults to IDP WantAuthnRequestsSigned
+	SignRequests *bool
+
+	// Private key we use to sign requests. If not set defaults to Key
+	SigningKey crypto.PrivateKey
+
+	// Certificate for the "signing" key descriptor in metadata. If not set defaults to Certificate
+	SigningCertificate *x509.Certificate
+
+	// Signing algorithm. If not set defaults to http://www.w3.org/2000/09/xmldsig#rsa-sha1, value of dsig.RSASHA1SignatureMethod
+	SigningAlgorithm string //TODO rename??
+
+	// Signing canonicalizer. If not set defaults to canonicalization algorithm http://www.w3.org/2001/10/xml-exc-c14n#, value of dsig.MakeC14N10ExclusiveCanonicalizerWithPrefixList("")
+	SigningCanonicalizer dsig.Canonicalizer
+
+	// Private key we use to decrypt responses. If not set defaults to Key
+	EncryptionKey crypto.PrivateKey
+
+	// Certificate for the "encryption" key descriptor in metadata. If not set defaults to Certificate
+	EncryptionCertificate *x509.Certificate
 }
 
 // MaxIssueDelay is the longest allowed time between when a SAML assertion is
@@ -127,23 +149,40 @@ func (sp *ServiceProvider) Metadata() *EntityDescriptor {
 	}
 
 	authnRequestsSigned := false
+	if sp.SignRequests != nil {
+		authnRequestsSigned = *sp.SignRequests
+	} else {
+		for idpIdx := range sp.IDPMetadata.IDPSSODescriptors {
+			if sp.ShouldSignRequest(&sp.IDPMetadata.IDPSSODescriptors[idpIdx]) {
+				authnRequestsSigned = true
+				break
+			}
+		}
+	}
+
 	wantAssertionsSigned := true
 	validUntil := TimeNow().Add(validDuration)
 
 	var keyDescriptors []KeyDescriptor
-	if sp.Certificate != nil {
-		certBytes := sp.Certificate.Raw
+	signingCertificate := sp.signingCertificate()
+	encryptionCertificate := sp.encryptionCertificate()
+	if signingCertificate != nil || encryptionCertificate != nil {
+		var intermediatesBytes []byte
 		for _, intermediate := range sp.Intermediates {
-			certBytes = append(certBytes, intermediate.Raw...)
+			intermediatesBytes = append(intermediatesBytes, intermediate.Raw...)
 		}
-		keyDescriptors = []KeyDescriptor{
-			{
+		if signingCertificate != nil {
+			certBytes := append(signingCertificate.Raw, intermediatesBytes...)
+			keyDescriptors = append(keyDescriptors, KeyDescriptor{
 				Use: "signing",
 				KeyInfo: KeyInfo{
 					Certificate: base64.StdEncoding.EncodeToString(certBytes),
 				},
-			},
-			{
+			})
+		}
+		if encryptionCertificate != nil {
+			certBytes := append(encryptionCertificate.Raw, intermediatesBytes...)
+			keyDescriptors = append(keyDescriptors, KeyDescriptor{
 				Use: "encryption",
 				KeyInfo: KeyInfo{
 					Certificate: base64.StdEncoding.EncodeToString(certBytes),
@@ -154,7 +193,7 @@ func (sp *ServiceProvider) Metadata() *EntityDescriptor {
 					{Algorithm: "http://www.w3.org/2001/04/xmlenc#aes256-cbc"},
 					{Algorithm: "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"},
 				},
-			},
+			})
 		}
 	}
 
@@ -197,18 +236,26 @@ func (sp *ServiceProvider) Metadata() *EntityDescriptor {
 // the HTTP-Redirect binding. It returns a URL that we will redirect the user to
 // in order to start the auth process.
 func (sp *ServiceProvider) MakeRedirectAuthenticationRequest(relayState string) (*url.URL, error) {
-	req, err := sp.MakeAuthenticationRequest(sp.GetSSOBindingLocation(HTTPRedirectBinding))
+	idpSSODescriptor, idpURL := sp.GetSSOBindingLocation(HTTPRedirectBinding)
+	req, err := sp.MakeAuthenticationRequest(idpURL)
 	if err != nil {
 		return nil, err
 	}
-	return req.Redirect(relayState), nil
+	redirectURL := req.Redirect(relayState)
+	if sp.ShouldSignRequest(idpSSODescriptor) {
+		err = sp.SignRedirectRequestURL(redirectURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return redirectURL, nil
 }
 
 // Redirect returns a URL suitable for using the redirect binding with the request
 func (req *AuthnRequest) Redirect(relayState string) *url.URL {
 	w := &bytes.Buffer{}
 	w1 := base64.NewEncoder(base64.StdEncoding, w)
-	w2, _ := flate.NewWriter(w1, 9)
+	w2, _ := flate.NewWriter(w1, flate.BestCompression)
 	doc := etree.NewDocument()
 	doc.SetRoot(req.Element())
 	if _, err := doc.WriteTo(w2); err != nil {
@@ -231,28 +278,28 @@ func (req *AuthnRequest) Redirect(relayState string) *url.URL {
 
 // GetSSOBindingLocation returns URL for the IDP's Single Sign On Service binding
 // of the specified type (HTTPRedirectBinding or HTTPPostBinding)
-func (sp *ServiceProvider) GetSSOBindingLocation(binding string) string {
-	for _, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
+func (sp *ServiceProvider) GetSSOBindingLocation(binding string) (*IDPSSODescriptor, string) {
+	for idpIdx, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
 		for _, singleSignOnService := range idpSSODescriptor.SingleSignOnServices {
 			if singleSignOnService.Binding == binding {
-				return singleSignOnService.Location
+				return &sp.IDPMetadata.IDPSSODescriptors[idpIdx], singleSignOnService.Location
 			}
 		}
 	}
-	return ""
+	return nil, ""
 }
 
 // GetSLOBindingLocation returns URL for the IDP's Single Log Out Service binding
 // of the specified type (HTTPRedirectBinding or HTTPPostBinding)
-func (sp *ServiceProvider) GetSLOBindingLocation(binding string) string {
-	for _, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
+func (sp *ServiceProvider) GetSLOBindingLocation(binding string) (*IDPSSODescriptor, string) {
+	for idpIdx, idpSSODescriptor := range sp.IDPMetadata.IDPSSODescriptors {
 		for _, singleLogoutService := range idpSSODescriptor.SingleLogoutServices {
 			if singleLogoutService.Binding == binding {
-				return singleLogoutService.Location
+				return &sp.IDPMetadata.IDPSSODescriptors[idpIdx], singleLogoutService.Location
 			}
 		}
 	}
-	return ""
+	return nil, ""
 }
 
 // getIDPSigningCerts returns the certificates which we can use to verify things
@@ -337,47 +384,45 @@ func (sp *ServiceProvider) MakeAuthenticationRequest(idpURL string) (*AuthnReque
 // the HTTP-POST binding. It returns HTML text representing an HTML form that
 // can be sent presented to a browser to initiate the login process.
 func (sp *ServiceProvider) MakePostAuthenticationRequest(relayState string) ([]byte, error) {
-	req, err := sp.MakeAuthenticationRequest(sp.GetSSOBindingLocation(HTTPPostBinding))
+	idpSSODescriptor, idpURL := sp.GetSSOBindingLocation(HTTPPostBinding)
+	req, err := sp.MakeAuthenticationRequest(idpURL)
 	if err != nil {
 		return nil, err
+	}
+	if sp.ShouldSignRequest(idpSSODescriptor) {
+		err = sp.SignPostAuthnRequest(req)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return req.Post(relayState), nil
 }
 
-// Post returns an HTML form suitable for using the HTTP-POST binding with the request
-func (req *AuthnRequest) Post(relayState string) []byte {
+func (req *AuthnRequest) PostTemplateData(relayState string) *RequestTemplateData {
 	doc := etree.NewDocument()
 	doc.SetRoot(req.Element())
 	reqBuf, err := doc.WriteToBytes()
 	if err != nil {
 		panic(err)
 	}
+
 	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 
-	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
-		`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
-		`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
-		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
-		`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
-		`</form>` +
-		`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";` +
-		`document.getElementById('SAMLRequestForm').submit();</script>`))
-	data := struct {
-		URL         string
-		SAMLRequest string
-		RelayState  string
-	}{
+	return &RequestTemplateData{
 		URL:         req.Destination,
 		SAMLRequest: encodedReqBuf,
 		RelayState:  relayState,
 	}
+}
 
-	rv := bytes.Buffer{}
-	if err := tmpl.Execute(&rv, data); err != nil {
+// Post returns an HTML form suitable for using the HTTP-POST binding with the request
+func (req *AuthnRequest) Post(relayState string) []byte {
+	td := req.PostTemplateData(relayState)
+	rv, err := td.ExecuteTemplate(DefaultRequestTemplate)
+	if err != nil {
 		panic(err)
 	}
-
-	return rv.Bytes()
+	return rv
 }
 
 // AssertionAttributes is a list of AssertionAttribute
@@ -465,6 +510,16 @@ func (sp *ServiceProvider) validateDestination(response []byte, responseDom *Res
 // ParseResponse extracts the SAML IDP response received in req, validates
 // it, and returns the verified assertion.
 func (sp *ServiceProvider) ParseResponse(req *http.Request, possibleRequestIDs []string) (*Assertion, error) {
+	_, resp, _, err := sp.ParseResponseExt(req, possibleRequestIDs)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Assertion, nil
+}
+
+// ParseResponse extracts the SAML IDP response received in req, validates
+// it, and returns the extracted response XML string, response object, along with decrypted assertion XML string (if it was encrypted in the first place).
+func (sp *ServiceProvider) ParseResponseExt(req *http.Request, possibleRequestIDs []string) (string, *Response, string, error) {
 	now := TimeNow()
 	retErr := &InvalidResponseError{
 		Now:      now,
@@ -474,16 +529,18 @@ func (sp *ServiceProvider) ParseResponse(req *http.Request, possibleRequestIDs [
 	rawResponseBuf, err := base64.StdEncoding.DecodeString(req.PostForm.Get("SAMLResponse"))
 	if err != nil {
 		retErr.PrivateErr = fmt.Errorf("cannot parse base64: %s", err)
-		return nil, retErr
+		return "", nil, "", retErr
 	}
-	retErr.Response = string(rawResponseBuf)
-	assertion, err := sp.ParseXMLResponse(rawResponseBuf, possibleRequestIDs)
+	responseXMLString := string(rawResponseBuf)
+	retErr.Response = responseXMLString
+
+	resp, decryptedAssertion, err := sp.ParseXMLResponseExt(rawResponseBuf, possibleRequestIDs)
 	if err != nil {
-		return nil, err
+		retErr.PrivateErr = err
+		return "", nil, "", retErr
 	}
 
-	return assertion, nil
-
+	return responseXMLString, resp, decryptedAssertion, nil
 }
 
 // ParseXMLResponse validates the SAML IDP response and
@@ -498,6 +555,25 @@ func (sp *ServiceProvider) ParseResponse(req *http.Request, possibleRequestIDs [
 // failed. However, to discourage inadvertent disclosure the diagnostic
 // information, the Error() method returns a static string.
 func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleRequestIDs []string) (*Assertion, error) {
+	resp, _, err := sp.ParseXMLResponseExt(decodedResponseXML, possibleRequestIDs)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Assertion, nil
+}
+
+// ParseXMLResponse validates the SAML IDP response and
+// returns the response object, along with decrypted assertion XML string (if it was encrypted in the first place).
+//
+// This function handles decrypting the message, verifying the digital
+// signature on the assertion, and verifying that the specified conditions
+// and properties are met.
+//
+// If the function fails it will return an InvalidResponseError whose
+// properties are useful in describing which part of the parsing process
+// failed. However, to discourage inadvertent disclosure the diagnostic
+// information, the Error() method returns a static string.
+func (sp *ServiceProvider) ParseXMLResponseExt(decodedResponseXML []byte, possibleRequestIDs []string) (*Response, string, error) {
 	now := TimeNow()
 	var err error
 	retErr := &InvalidResponseError{
@@ -506,15 +582,15 @@ func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleR
 	}
 
 	// do some validation first before we decrypt
-	resp := Response{}
-	if err := xml.Unmarshal([]byte(decodedResponseXML), &resp); err != nil {
+	resp := &Response{}
+	if err := xml.Unmarshal([]byte(decodedResponseXML), resp); err != nil {
 		retErr.PrivateErr = fmt.Errorf("cannot unmarshal response: %s", err)
-		return nil, retErr
+		return nil, "", retErr
 	}
 
-	if err := sp.validateDestination(decodedResponseXML, &resp); err != nil {
+	if err := sp.validateDestination(decodedResponseXML, resp); err != nil {
 		retErr.PrivateErr = err
-		return nil, retErr
+		return nil, "", retErr
 	}
 
 	requestIDvalid := false
@@ -531,41 +607,42 @@ func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleR
 
 	if !requestIDvalid {
 		retErr.PrivateErr = fmt.Errorf("`InResponseTo` does not match any of the possible request IDs (expected %v)", possibleRequestIDs)
-		return nil, retErr
+		return nil, "", retErr
 	}
 
 	if resp.IssueInstant.Add(MaxIssueDelay).Before(now) {
 		retErr.PrivateErr = fmt.Errorf("response IssueInstant expired at %s", resp.IssueInstant.Add(MaxIssueDelay))
-		return nil, retErr
+		return nil, "", retErr
 	}
 	if resp.Issuer.Value != sp.IDPMetadata.EntityID {
 		retErr.PrivateErr = fmt.Errorf("response Issuer does not match the IDP metadata (expected %q)", sp.IDPMetadata.EntityID)
-		return nil, retErr
+		return nil, "", retErr
 	}
 	if resp.Status.StatusCode.Value != StatusSuccess {
 		retErr.PrivateErr = ErrBadStatus{Status: resp.Status.StatusCode.Value}
-		return nil, retErr
+		return nil, "", retErr
 	}
 
 	var assertion *Assertion
+	var decryptedAssertion string
 	if resp.EncryptedAssertion == nil {
 
 		doc := etree.NewDocument()
 		if err := doc.ReadFromBytes(decodedResponseXML); err != nil {
 			retErr.PrivateErr = err
-			return nil, retErr
+			return nil, "", retErr
 		}
 
 		// TODO(ross): verify that the namespace is urn:oasis:names:tc:SAML:2.0:protocol
 		responseEl := doc.Root()
 		if responseEl.Tag != "Response" {
 			retErr.PrivateErr = fmt.Errorf("expected to find a response object, not %s", doc.Root().Tag)
-			return nil, retErr
+			return nil, "", retErr
 		}
 
 		if err = sp.validateSigned(responseEl); err != nil {
 			retErr.PrivateErr = err
-			return nil, retErr
+			return nil, "", retErr
 		}
 
 		assertion = resp.Assertion
@@ -573,18 +650,24 @@ func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleR
 
 	// decrypt the response
 	if resp.EncryptedAssertion != nil {
+		var key interface{} = sp.encryptionKey()
+		if key == nil {
+			retErr.PrivateErr = errors.New("no encryption key set")
+			return nil, "", retErr
+		}
+
 		doc := etree.NewDocument()
 		if err := doc.ReadFromBytes(decodedResponseXML); err != nil {
 			retErr.PrivateErr = err
-			return nil, retErr
+			return nil, "", retErr
 		}
-		var key interface{} = sp.Key
+
 		keyEl := doc.FindElement("//EncryptedAssertion/EncryptedKey")
 		if keyEl != nil {
-			key, err = xmlenc.Decrypt(sp.Key, keyEl)
+			key, err = xmlenc.Decrypt(key, keyEl)
 			if err != nil {
 				retErr.PrivateErr = fmt.Errorf("failed to decrypt key from response: %s", err)
-				return nil, retErr
+				return nil, "", retErr
 			}
 		}
 
@@ -592,34 +675,38 @@ func (sp *ServiceProvider) ParseXMLResponse(decodedResponseXML []byte, possibleR
 		plaintextAssertion, err := xmlenc.Decrypt(key, el)
 		if err != nil {
 			retErr.PrivateErr = fmt.Errorf("failed to decrypt response: %s", err)
-			return nil, retErr
+			return nil, "", retErr
 		}
-		retErr.Response = string(plaintextAssertion)
+
+		decryptedAssertion = string(plaintextAssertion)
+		retErr.Response = decryptedAssertion
 
 		doc = etree.NewDocument()
 		if err := doc.ReadFromBytes(plaintextAssertion); err != nil {
 			retErr.PrivateErr = fmt.Errorf("cannot parse plaintext response %v", err)
-			return nil, retErr
+			return nil, "", retErr
 		}
 
 		if err := sp.validateSigned(doc.Root()); err != nil {
 			retErr.PrivateErr = err
-			return nil, retErr
+			return nil, "", retErr
 		}
 
 		assertion = &Assertion{}
 		if err := xml.Unmarshal(plaintextAssertion, assertion); err != nil {
 			retErr.PrivateErr = err
-			return nil, retErr
+			return nil, "", retErr
 		}
+
+		resp.Assertion = assertion
 	}
 
 	if err := sp.validateAssertion(assertion, possibleRequestIDs, now); err != nil {
 		retErr.PrivateErr = fmt.Errorf("assertion invalid: %s", err)
-		return nil, retErr
+		return nil, "", retErr
 	}
 
-	return assertion, nil
+	return resp, decryptedAssertion, nil
 }
 
 // validateAssertion checks that the conditions specified in assertion match
@@ -741,11 +828,10 @@ func (sp *ServiceProvider) validateSigned(responseEl *etree.Element) error {
 	return nil
 }
 
-// validateSignature returns nill iff the Signature embedded in the element is valid
-func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
+func (sp *ServiceProvider) validationContext() (*dsig.ValidationContext, error) {
 	certs, err := sp.getIDPSigningCerts()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	certificateStore := dsig.MemoryX509CertificateStore{
@@ -756,6 +842,16 @@ func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
 	validationContext.IdAttribute = "ID"
 	if Clock != nil {
 		validationContext.Clock = Clock
+	}
+
+	return validationContext, nil
+}
+
+// validateSignature returns nill iff the Signature embedded in the element is valid
+func (sp *ServiceProvider) validateSignature(el *etree.Element) error {
+	validationContext, err := sp.validationContext()
+	if err != nil {
+		return err
 	}
 
 	// Some SAML responses contain a RSAKeyValue element. One of two things is happening here:
@@ -812,7 +908,7 @@ func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID string) (*LogoutRequ
 			Format:          sp.nameIDFormat(),
 			Value:           nameID,
 			NameQualifier:   sp.IDPMetadata.EntityID,
-			SPNameQualifier: sp.Metadata().EntityID,
+			SPNameQualifier: firstSet(sp.EntityID, sp.MetadataURL.String()),
 		},
 	}
 	return &req, nil
@@ -822,11 +918,19 @@ func (sp *ServiceProvider) MakeLogoutRequest(idpURL, nameID string) (*LogoutRequ
 // the HTTP-Redirect binding. It returns a URL that we will redirect the user to
 // in order to start the auth process.
 func (sp *ServiceProvider) MakeRedirectLogoutRequest(nameID, relayState string) (*url.URL, error) {
-	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPRedirectBinding), nameID)
+	idpSSODescriptor, idpURL := sp.GetSLOBindingLocation(HTTPRedirectBinding)
+	req, err := sp.MakeLogoutRequest(idpURL, nameID)
 	if err != nil {
 		return nil, err
 	}
-	return req.Redirect(relayState), nil
+	redirectURL := req.Redirect(relayState)
+	if sp.ShouldSignRequest(idpSSODescriptor) {
+		err = sp.SignRedirectRequestURL(redirectURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return redirectURL, nil
 }
 
 // Redirect returns a URL suitable for using the redirect binding with the request
@@ -858,47 +962,45 @@ func (req *LogoutRequest) Redirect(relayState string) *url.URL {
 // the HTTP-POST binding. It returns HTML text representing an HTML form that
 // can be sent presented to a browser to initiate the logout process.
 func (sp *ServiceProvider) MakePostLogoutRequest(nameID, relayState string) ([]byte, error) {
-	req, err := sp.MakeLogoutRequest(sp.GetSLOBindingLocation(HTTPPostBinding), nameID)
+	idpSSODescriptor, idpURL := sp.GetSLOBindingLocation(HTTPPostBinding)
+	req, err := sp.MakeLogoutRequest(idpURL, nameID)
 	if err != nil {
 		return nil, err
+	}
+	if sp.ShouldSignRequest(idpSSODescriptor) {
+		err = sp.SignPostLogoutRequest(req)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return req.Post(relayState), nil
 }
 
-// Post returns an HTML form suitable for using the HTTP-POST binding with the request
-func (req *LogoutRequest) Post(relayState string) []byte {
+func (req *LogoutRequest) PostTemplateData(relayState string) *RequestTemplateData {
 	doc := etree.NewDocument()
 	doc.SetRoot(req.Element())
 	reqBuf, err := doc.WriteToBytes()
 	if err != nil {
 		panic(err)
 	}
+
 	encodedReqBuf := base64.StdEncoding.EncodeToString(reqBuf)
 
-	tmpl := template.Must(template.New("saml-post-form").Parse(`` +
-		`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
-		`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
-		`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
-		`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
-		`</form>` +
-		`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";` +
-		`document.getElementById('SAMLRequestForm').submit();</script>`))
-	data := struct {
-		URL         string
-		SAMLRequest string
-		RelayState  string
-	}{
+	return &RequestTemplateData{
 		URL:         req.Destination,
 		SAMLRequest: encodedReqBuf,
 		RelayState:  relayState,
 	}
+}
 
-	rv := bytes.Buffer{}
-	if err := tmpl.Execute(&rv, data); err != nil {
+// Post returns an HTML form suitable for using the HTTP-POST binding with the request
+func (req *LogoutRequest) Post(relayState string) []byte {
+	td := req.PostTemplateData(relayState)
+	rv, err := td.ExecuteTemplate(DefaultRequestTemplate)
+	if err != nil {
 		panic(err)
 	}
-
-	return rv.Bytes()
+	return rv
 }
 
 func (sp *ServiceProvider) nameIDFormat() string {
@@ -1021,4 +1123,189 @@ func firstSet(a, b string) string {
 		return b
 	}
 	return a
+}
+
+func (sp *ServiceProvider) signingKey() crypto.PrivateKey {
+	if sp.SigningKey != nil {
+		return sp.SigningKey
+	}
+	return sp.Key
+}
+
+func (sp *ServiceProvider) encryptionKey() crypto.PrivateKey {
+	if sp.EncryptionKey != nil {
+		return sp.EncryptionKey
+	}
+	return sp.Key
+}
+
+func (sp *ServiceProvider) signingCertificate() *x509.Certificate {
+	if sp.SigningCertificate != nil {
+		return sp.SigningCertificate
+	}
+	return sp.Certificate
+}
+
+func (sp *ServiceProvider) encryptionCertificate() *x509.Certificate {
+	if sp.EncryptionCertificate != nil {
+		return sp.EncryptionCertificate
+	}
+	return sp.Certificate
+}
+
+func (sp *ServiceProvider) signingContext() (*dsig.SigningContext, error) {
+
+	signingKey := sp.signingKey()
+	if signingKey == nil {
+		return nil, errors.New("no signing key set")
+	}
+
+	signingCertificate := sp.signingCertificate()
+	if signingCertificate == nil {
+		return nil, errors.New("no signing certificate set")
+	}
+
+	signingContext := &dsig.SigningContext{
+		IdAttribute:   dsig.DefaultIdAttr,
+		Prefix:        dsig.DefaultPrefix,
+	}
+
+	keyPair := tls.Certificate{
+		Certificate: [][]byte{signingCertificate.Raw},
+		PrivateKey:  signingKey,
+	}
+	for _, intermediate := range sp.Intermediates {
+		keyPair.Certificate = append(keyPair.Certificate, intermediate.Raw)
+	}
+
+	var err error
+	signingContext.KeyStore = dsig.TLSCertKeyStore(keyPair)
+	if sp.SigningAlgorithm != "" {
+		err = signingContext.SetSignatureMethod(sp.SigningAlgorithm)
+	} else {
+		err = signingContext.SetSignatureMethod(dsig.RSASHA1SignatureMethod)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if sp.SigningCanonicalizer != nil {
+		signingContext.Canonicalizer = sp.SigningCanonicalizer
+	} else {
+		signingContext.Canonicalizer = dsig.MakeC14N10ExclusiveCanonicalizerWithPrefixList("")
+	}
+
+	return signingContext, nil
+}
+
+func (sp *ServiceProvider) ShouldSignRequest(descriptor *IDPSSODescriptor) bool {
+	if sp.SignRequests != nil {
+		return *sp.SignRequests
+	}
+	if sp.signingCertificate() == nil {
+		return false
+	}
+	return  descriptor != nil &&
+		descriptor.WantAuthnRequestsSigned != nil &&
+		*descriptor.WantAuthnRequestsSigned == true
+}
+
+func (sp *ServiceProvider) SignPostAuthnRequest(req *AuthnRequest) error {
+	ctx, err := sp.signingContext()
+	if err != nil {
+		return err
+	}
+	el := req.Element()
+	sigEl, err := ctx.ConstructSignature(el, true)
+	if err != nil {
+		return err
+	}
+	req.Signature = sigEl
+	return nil
+}
+
+func (sp *ServiceProvider) SignPostLogoutRequest(req *LogoutRequest) error {
+	ctx, err := sp.signingContext()
+	if err != nil {
+		return err
+	}
+	el := req.Element()
+	sigEl, err := ctx.ConstructSignature(el, true)
+	if err != nil {
+		return err
+	}
+	req.Signature = sigEl
+	return nil
+}
+
+func (sp *ServiceProvider) SignRedirectRequestURL(redirectURL *url.URL) error {
+	ctx, err := sp.signingContext()
+	if err != nil {
+		return err
+	}
+
+	query := redirectURL.Query()
+
+	samlRequest := query.Get("SAMLRequest")
+	relayState := query.Get("RelayState")
+	sigAlg := ctx.GetSignatureMethodIdentifier()
+
+	toBeSigned := "SAMLRequest=" + url.QueryEscape(samlRequest)
+	if relayState != "" {
+		toBeSigned += "&RelayState=" + url.QueryEscape(relayState)
+	}
+	toBeSigned += "&SigAlg=" + url.QueryEscape(sigAlg)
+
+	rawSignature, err := ctx.SignString(toBeSigned)
+	if err != nil {
+		return fmt.Errorf("unable to sign query string of redirect URL: %w", err)
+	}
+
+	query.Set("SigAlg", sigAlg)
+	query.Set("Signature", base64.StdEncoding.EncodeToString(rawSignature))
+
+	redirectURL.RawQuery = query.Encode()
+
+	return nil
+}
+
+// Used with AuthnRequest and LogoutRequest
+var DefaultRequestTemplate = template.Must(template.New("saml-post-form").Parse(`` +
+	`<form method="post" action="{{.URL}}" id="SAMLRequestForm">` +
+	`<input type="hidden" name="SAMLRequest" value="{{.SAMLRequest}}" />` +
+	`<input type="hidden" name="RelayState" value="{{.RelayState}}" />` +
+	`<input id="SAMLSubmitButton" type="submit" value="Submit" />` +
+	`</form>` +
+	`<script>document.getElementById('SAMLSubmitButton').style.visibility="hidden";` +
+	`document.getElementById('SAMLRequestForm').submit();</script>`))
+
+// Used with AuthnRequest and LogoutRequest
+type RequestTemplateData struct {
+	URL         string
+	SAMLRequest string
+	RelayState  string
+}
+
+func (rd *RequestTemplateData) ExecuteTemplate(tmpl *template.Template) ([]byte, error) {
+	rv := bytes.Buffer{}
+	if err := tmpl.Execute(&rv, rd); err != nil {
+		return nil, err
+	}
+	return rv.Bytes(), nil
+}
+
+func (rd *RequestTemplateData) ExecuteTemplateString(templateStr string) ([]byte, error) {
+	tmpl, err := template.New("saml-post-form").Parse(templateStr)
+	if err != nil {
+		return nil, err
+	}
+	return rd.ExecuteTemplate(tmpl)
+}
+
+func (rd *RequestTemplateData) ExecuteTemplateFile(templateFilename string) ([]byte, error) {
+	tmpl, err := template.ParseFiles(templateFilename)
+	if err != nil {
+		return nil, err
+	}
+	return rd.ExecuteTemplate(tmpl)
 }

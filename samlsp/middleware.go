@@ -4,7 +4,7 @@ import (
 	"encoding/xml"
 	"net/http"
 
-	"github.com/crewjam/saml"
+	"github.com/vereignag/saml"
 )
 
 // Middleware implements middleware than allows a web application
@@ -126,15 +126,16 @@ func (m *Middleware) HandleStartAuthFlow(w http.ResponseWriter, r *http.Request)
 	}
 
 	var binding, bindingLocation string
+	var idpSSODescriptor *saml.IDPSSODescriptor
 	if m.Binding != "" {
 		binding = m.Binding
-		bindingLocation = m.ServiceProvider.GetSSOBindingLocation(binding)
+		idpSSODescriptor, bindingLocation = m.ServiceProvider.GetSSOBindingLocation(binding)
 	} else {
 		binding = saml.HTTPRedirectBinding
-		bindingLocation = m.ServiceProvider.GetSSOBindingLocation(binding)
+		idpSSODescriptor, bindingLocation = m.ServiceProvider.GetSSOBindingLocation(binding)
 		if bindingLocation == "" {
 			binding = saml.HTTPPostBinding
-			bindingLocation = m.ServiceProvider.GetSSOBindingLocation(binding)
+			idpSSODescriptor, bindingLocation = m.ServiceProvider.GetSSOBindingLocation(binding)
 		}
 	}
 
@@ -156,11 +157,25 @@ func (m *Middleware) HandleStartAuthFlow(w http.ResponseWriter, r *http.Request)
 
 	if binding == saml.HTTPRedirectBinding {
 		redirectURL := authReq.Redirect(relayState)
+		if m.ServiceProvider.ShouldSignRequest(idpSSODescriptor) {
+			err = m.ServiceProvider.SignRedirectRequestURL(redirectURL)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
 		w.Header().Add("Location", redirectURL.String())
 		w.WriteHeader(http.StatusFound)
 		return
 	}
 	if binding == saml.HTTPPostBinding {
+		if m.ServiceProvider.ShouldSignRequest(idpSSODescriptor) {
+			err = m.ServiceProvider.SignPostAuthnRequest(authReq)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
 		w.Header().Add("Content-Security-Policy", ""+
 			"default-src; "+
 			"script-src 'sha256-AjPdJSbZmeWHnEc5ykvJFay8FTWeTeRbs9dutfZ0HqE='; "+

@@ -21,9 +21,9 @@ import (
 	"github.com/dgrijalva/jwt-go"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/crewjam/saml/logger"
-	"github.com/crewjam/saml/testsaml"
-	"github.com/crewjam/saml/xmlenc"
+	"github.com/vereignag/saml/logger"
+	"github.com/vereignag/saml/testsaml"
+	"github.com/vereignag/saml/xmlenc"
 )
 
 type IdentityProviderTest struct {
@@ -314,7 +314,8 @@ func TestIDPCanHandlePostRequestWithExistingSession(t *testing.T) {
 
 	w := httptest.NewRecorder()
 
-	authRequest, err := test.SP.MakeAuthenticationRequest(test.SP.GetSSOBindingLocation(HTTPRedirectBinding))
+	_, bindingLocation := test.SP.GetSSOBindingLocation(HTTPRedirectBinding)
+	authRequest, err := test.SP.MakeAuthenticationRequest(bindingLocation)
 	assert.NoError(t, err)
 	authRequestBuf, err := xml.Marshal(authRequest)
 	assert.NoError(t, err)

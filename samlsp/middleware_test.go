@@ -21,8 +21,8 @@ import (
 	dsig "github.com/russellhaering/goxmldsig"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/crewjam/saml"
-	"github.com/crewjam/saml/testsaml"
+	"github.com/vereignag/saml"
+	"github.com/vereignag/saml/testsaml"
 )
 
 type MiddlewareTest struct {
@@ -270,8 +270,8 @@ func TestMiddlewareRequireAccountNoCredsSecure(t *testing.T) {
 func TestMiddlewareRequireAccountNoCredsPostBinding(t *testing.T) {
 	test := NewMiddlewareTest()
 	test.Middleware.ServiceProvider.IDPMetadata.IDPSSODescriptors[0].SingleSignOnServices = test.Middleware.ServiceProvider.IDPMetadata.IDPSSODescriptors[0].SingleSignOnServices[1:2]
-	assert.Equal(t, "",
-		test.Middleware.ServiceProvider.GetSSOBindingLocation(saml.HTTPRedirectBinding))
+	_, bindingLocation := test.Middleware.ServiceProvider.GetSSOBindingLocation(saml.HTTPRedirectBinding)
+	assert.Equal(t, "", bindingLocation)
 
 	handler := test.Middleware.RequireAccount(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
