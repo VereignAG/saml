@@ -53,8 +53,8 @@ type LogoutRequest struct {
 	IssueInstant time.Time `xml:",attr"`
 	Destination  string    `xml:",attr"`
 	Issuer       *Issuer   `xml:"urn:oasis:names:tc:SAML:2.0:assertion Issuer"`
-	NameID       *NameID
 	Signature    *etree.Element
+	NameID       *NameID
 
 	SessionIndex *SessionIndex `xml:"SessionIndex"`
 }
@@ -73,11 +73,11 @@ func (r *LogoutRequest) Element() *etree.Element {
 	if r.Issuer != nil {
 		el.AddChild(r.Issuer.Element())
 	}
-	if r.NameID != nil {
-		el.AddChild(r.NameID.Element())
-	}
 	if r.Signature != nil {
 		el.AddChild(r.Signature)
+	}
+	if r.NameID != nil {
+		el.AddChild(r.NameID.Element())
 	}
 	if r.SessionIndex != nil {
 		el.AddChild(r.SessionIndex.Element())
@@ -892,7 +892,7 @@ func (a *ProxyRestriction) Element() *etree.Element {
 type AuthnStatement struct {
 	AuthnInstant        time.Time  `xml:",attr"`
 	SessionIndex        string     `xml:",attr"`
-	SessionNotOnOrAfter *time.Time `xml:",attr"`
+	SessionNotOnOrAfter *time.Time `xml:",attr,omitempty"`
 	SubjectLocality     *SubjectLocality
 	AuthnContext        AuthnContext
 }
