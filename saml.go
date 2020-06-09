@@ -1,5 +1,5 @@
 // 
-// [![](https://godoc.org/github.com/crewjam/saml?status.svg)](http://godoc.org/github.com/crewjam/saml)
+// [![](https://godoc.org/github.com/vereignag/saml?status.svg)](http://godoc.org/github.com/vereignag/saml)
 // 
 // [![Build Status](https://travis-ci.org/crewjam/saml.svg?branch=master)](https://travis-ci.org/crewjam/saml)
 // 
@@ -16,7 +16,7 @@
 // 
 // Version 0.4.0 introduces a few breaking changes to the _samlsp_ package in order to make the package more extensible, and to clean up the interfaces a bit. The default behavior remains the same, but you can now provide interface implementations of _RequestTracker_ (which tracks pending requests), _Session_ (which handles maintaining a session) and _OnError_ which handles reporting errors.
 // 
-// Public fields of _samlsp.Middleware_ have changed, so some usages may require adjustment. See [issue 231](https://github.com/crewjam/saml/issues/231) for details.
+// Public fields of _samlsp.Middleware_ have changed, so some usages may require adjustment. See [issue 231](https://github.com/vereignag/saml/issues/231) for details.
 // 
 // The option to provide an IDP metadata URL has been deprecated. Instead, we recommend that you use the `FetchMetadata()` function, or fetch the metadata yourself and use the new `ParseMetadata()` function, and pass the metadata in _samlsp.Options.IDPMetadata_.
 // 
@@ -77,7 +77,7 @@
 // 	"net/http"
 // 	"net/url"
 // 
-// 	"github.com/crewjam/saml/samlsp"
+// 	"github.com/vereignag/saml/samlsp"
 // )
 // 
 // func hello(w http.ResponseWriter, r *http.Request) {

@@ -22,8 +22,8 @@ import (
 	"github.com/beevik/etree"
 	dsig "github.com/russellhaering/goxmldsig"
 
-	"github.com/crewjam/saml/logger"
-	"github.com/crewjam/saml/xmlenc"
+	"github.com/vereignag/saml/logger"
+	"github.com/vereignag/saml/xmlenc"
 )
 
 // Session represents a user session. It is returned by the

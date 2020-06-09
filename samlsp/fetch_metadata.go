@@ -10,7 +10,7 @@ import (
 
 	"github.com/crewjam/httperr"
 
-	"github.com/crewjam/saml"
+	"github.com/vereignag/saml"
 )
 
 // ParseMetadata parses arbitrary SAML IDP metadata.
